@@ -27,6 +27,11 @@ class SlidingWindowDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tenso
         self.step_size = step_size
         self.starts = list(range(0, series.size(0) - window_size + 1, step_size))
 
+        # 确保覆盖序列最尾部，防止步长导致最后几个点被丢弃
+        last_valid_start = series.size(0) - window_size
+        if len(self.starts) == 0 or self.starts[-1] != last_valid_start:
+            self.starts.append(last_valid_start)
+
     def __len__(self) -> int:
         return len(self.starts)
 
