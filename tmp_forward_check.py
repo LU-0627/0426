@@ -1,269 +1,99 @@
-"""
-Dummy forward-pass equivalence check.
-
-Verifies:
-1. All import paths resolve (no ModuleNotFoundError).
-2. The refactored models/ package produces identical outputs to the monolithic
-   fusion_anomaly_detector.py for the same random input and identical weights.
-3. loss.backward() completes without error (NCDE gradient chain intact).
-4. All named parameters receive non-None gradients.
-"""
+"""Quick sanity check after the 4-point refactoring."""
 from __future__ import annotations
 
 import sys
-import traceback
 
 import torch
 
 
-def section(title: str) -> None:
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
-
-
-def check_imports() -> bool:
-    """Phase 1: verify every cross-package import resolves."""
-    section("Phase 1: Import Path Verification")
-    ok = True
-
-    imports = [
-        ("models", None),
-        ("models.layers", "CDEFunc"),
-        ("models.layers", "CausalGraphGenerator"),
-        ("models.layers", "NCDEBranch"),
-        ("models.layers", "TimeSpatialTransformer"),
-        ("models.FusionModel", "FusionAnomalyDetector"),
-        ("models.FusionModel", "JointLoss"),
-        ("util", None),
-        ("util.preprocess", "DataProcessor"),
-        ("util.env", "set_seed"),
-        ("util.env", "get_device"),
-        ("util.iostream", "log_info"),
-        ("util.iostream", "save_checkpoint"),
-        ("util.iostream", "load_checkpoint"),
-        ("util.iostream", "summarize_metrics"),
-        ("datasets", None),
-        ("datasets.TimeDataset", "SlidingWindowDataset"),
-    ]
-
-    for module_name, attr in imports:
-        label = f"{module_name}.{attr}" if attr else module_name
-        try:
-            mod = __import__(module_name, fromlist=[attr] if attr else [])
-            if attr:
-                getattr(mod, attr)
-            print(f"  [PASS] {label}")
-        except Exception as exc:
-            print(f"  [FAIL] {label}  -->  {exc}")
-            ok = False
-
-    return ok
-
-
-def check_refactored_forward() -> bool:
-    """Phase 2: forward + backward through the refactored package."""
-    section("Phase 2: Refactored Package Forward + Backward")
-
-    from models.FusionModel import FusionAnomalyDetector as RefactoredModel
-
-    B, W, C, H = 4, 50, 5, 32
-    torch.manual_seed(42)
-    X = torch.randn(B, W, C)
-
-    model = RefactoredModel(hidden_dim=H)
-    outputs = model(X)
-
-    print("  Output keys:", list(outputs.keys()))
-    for k, v in outputs.items():
-        if isinstance(v, torch.Tensor):
-            has_nan = bool(torch.isnan(v).any())
-            print(f"  {k:20s}  shape={str(tuple(v.shape)):20s}  nan={has_nan}")
-            if has_nan:
-                print(f"  [WARN] {k} contains NaN!")
-
-    loss = outputs["loss"]
-    print(f"\n  loss = {loss.item():.6f}")
-    loss.backward()
-
-    no_grad_params = []
-    for name, p in model.named_parameters():
-        if p.grad is None:
-            no_grad_params.append(name)
-
-    if no_grad_params:
-        print(f"\n  [WARN] {len(no_grad_params)} parameter(s) received NO gradient:")
-        for n in no_grad_params:
-            print(f"    - {n}")
-    else:
-        print(f"\n  [PASS] All {sum(1 for _ in model.parameters())} parameters received gradients.")
-
-    return True
-
-
-def check_monolithic_forward() -> bool:
-    """Phase 3: forward + backward through the monolithic file."""
-    section("Phase 3: Monolithic File Forward + Backward")
-
-    from fusion_anomaly_detector import FusionAnomalyDetector as MonolithicModel
-
-    B, W, C, H = 4, 50, 5, 32
-    torch.manual_seed(42)
-    X = torch.randn(B, W, C)
-
-    model = MonolithicModel(hidden_dim=H)
-    outputs = model(X)
-
-    print("  Output keys:", list(outputs.keys()))
-    for k, v in outputs.items():
-        if isinstance(v, torch.Tensor):
-            has_nan = bool(torch.isnan(v).any())
-            print(f"  {k:20s}  shape={str(tuple(v.shape)):20s}  nan={has_nan}")
-
-    loss = outputs["loss"]
-    print(f"\n  loss = {loss.item():.6f}")
-    loss.backward()
-
-    no_grad_params = []
-    for name, p in model.named_parameters():
-        if p.grad is None:
-            no_grad_params.append(name)
-
-    if no_grad_params:
-        print(f"\n  [WARN] {len(no_grad_params)} parameter(s) received NO gradient:")
-        for n in no_grad_params:
-            print(f"    - {n}")
-    else:
-        print(f"\n  [PASS] All {sum(1 for _ in model.parameters())} parameters received gradients.")
-
-    return True
-
-
-def check_output_equivalence() -> bool:
-    """Phase 4: numerical equivalence between monolithic and refactored."""
-    section("Phase 4: Output Equivalence (monolithic vs refactored)")
-
-    from fusion_anomaly_detector import FusionAnomalyDetector as MonolithicModel
-    from models.FusionModel import FusionAnomalyDetector as RefactoredModel
-
-    B, W, C, H = 4, 50, 5, 32
-
-    # Build both models with the same seed so lazy-init weights match.
-    torch.manual_seed(99)
-    model_mono = MonolithicModel(hidden_dim=H)
-    # Trigger lazy init so state_dict contains NCDE params.
-    # CausalGraphGenerator needs autograd, so we can't use torch.no_grad().
-    model_mono.eval()
-    dummy_init = torch.randn(1, W, C)
-    with torch.set_grad_enabled(True):
-        _ = model_mono(dummy_init)
-
-    torch.manual_seed(99)
-    model_ref = RefactoredModel(hidden_dim=H)
-    model_ref.eval()
-    dummy_init2 = torch.randn(1, W, C)
-    with torch.set_grad_enabled(True):
-        _ = model_ref(dummy_init2)
-
-    # Copy weights from monolithic -> refactored.
-    mono_sd = model_mono.state_dict()
-    ref_sd = model_ref.state_dict()
-
-    # Check key alignment
-    mono_keys = set(mono_sd.keys())
-    ref_keys = set(ref_sd.keys())
-    if mono_keys != ref_keys:
-        only_mono = mono_keys - ref_keys
-        only_ref = ref_keys - mono_keys
-        if only_mono:
-            print(f"  [WARN] Keys only in monolithic: {only_mono}")
-        if only_ref:
-            print(f"  [WARN] Keys only in refactored: {only_ref}")
-        print("  [SKIP] Cannot do numerical comparison — key mismatch.")
-        return True  # not a fatal failure
-
-    model_ref.load_state_dict(mono_sd)
-
-    # Same input
-    torch.manual_seed(123)
-    X = torch.randn(B, W, C)
-
-    model_mono.eval()
-    model_ref.eval()
-
-    with torch.set_grad_enabled(True):
-        out_mono = model_mono(X.clone().requires_grad_(False))
-        out_ref = model_ref(X.clone().requires_grad_(False))
-
-    all_close = True
-    for key in out_mono:
-        v_mono = out_mono[key]
-        v_ref = out_ref[key]
-        if isinstance(v_mono, torch.Tensor) and isinstance(v_ref, torch.Tensor):
-            if v_mono.shape != v_ref.shape:
-                print(f"  [FAIL] {key}: shape mismatch {v_mono.shape} vs {v_ref.shape}")
-                all_close = False
-                continue
-            max_diff = (v_mono - v_ref).abs().max().item()
-            ok = max_diff < 1e-4
-            status = "PASS" if ok else "FAIL"
-            print(f"  [{status}] {key:20s}  max_diff={max_diff:.2e}")
-            if not ok:
-                all_close = False
-
-    return all_close
-
-
 def main() -> None:
-    print("Dummy Forward-Pass Equivalence Check")
     print(f"Python: {sys.version}")
     print(f"PyTorch: {torch.__version__}")
+    errors = []
 
-    results = {}
+    # 1. Check Dataset returns 3-tuple with start_idx
+    print("\n[1] datasets.TimeDataset.SlidingWindowDataset ...")
+    from datasets.TimeDataset import SlidingWindowDataset
 
-    # Phase 1
-    try:
-        results["imports"] = check_imports()
-    except Exception:
-        traceback.print_exc()
-        results["imports"] = False
+    series = torch.randn(200, 5)
+    ds = SlidingWindowDataset(series, window_size=50, step_size=10)
+    sample = ds[0]
+    assert len(sample) == 3, f"Expected 3-tuple, got {len(sample)}"
+    x, y, start_idx = sample
+    assert x.shape == (50, 5), f"x shape: {x.shape}"
+    assert y.shape == (50, 5), f"y shape: {y.shape}"
+    assert start_idx.dtype == torch.long, f"start_idx dtype: {start_idx.dtype}"
+    assert start_idx.item() == 0, f"start_idx value: {start_idx.item()}"
+    # Check a later sample
+    x2, y2, si2 = ds[3]
+    assert si2.item() == 30, f"start_idx[3] should be 30, got {si2.item()}"
+    print("  [PASS] Returns (x, y, start_idx) correctly")
 
-    if not results["imports"]:
-        print("\n[ABORT] Import checks failed — cannot proceed.")
-        sys.exit(1)
+    # 2. Check train.py has train_one_epoch and nothing else
+    print("\n[2] train.py ...")
+    import train
+    assert hasattr(train, "train_one_epoch"), "Missing train_one_epoch"
+    for forbidden in ["SlidingWindowDataset", "collate_windows", "aggregate_window_scores",
+                       "evaluate_model", "TrainConfig", "parse_args", "main"]:
+        if hasattr(train, forbidden):
+            errors.append(f"train.py still has '{forbidden}'")
+            print(f"  [FAIL] train.py still exports '{forbidden}'")
+    if not errors:
+        print("  [PASS] train.py is clean (only train_one_epoch)")
 
-    # Phase 2
-    try:
-        results["refactored_fwd"] = check_refactored_forward()
-    except Exception:
-        traceback.print_exc()
-        results["refactored_fwd"] = False
+    # 3. Check evaluate.py has all eval functions
+    print("\n[3] evaluate.py ...")
+    import evaluate
+    for fn in ["aggregate_window_scores", "point_adjust_predictions",
+                "compute_point_adjusted_f1", "compute_vus_pr_or_fallback", "evaluate_model"]:
+        if not hasattr(evaluate, fn):
+            errors.append(f"evaluate.py missing '{fn}'")
+            print(f"  [FAIL] evaluate.py missing '{fn}'")
+    if not any("evaluate.py" in e for e in errors):
+        print("  [PASS] evaluate.py has all evaluation functions")
 
-    # Phase 3
-    try:
-        results["monolithic_fwd"] = check_monolithic_forward()
-    except Exception:
-        traceback.print_exc()
-        results["monolithic_fwd"] = False
+    # 4. Check main.py imports
+    print("\n[4] main.py imports ...")
+    import main
+    for attr in ["TrainConfig", "collate_windows", "load_array", "train_model", "parse_args", "main"]:
+        if not hasattr(main, attr):
+            errors.append(f"main.py missing '{attr}'")
+            print(f"  [FAIL] main.py missing '{attr}'")
+    if not any("main.py" in e for e in errors):
+        print("  [PASS] main.py has all orchestration functions")
 
-    # Phase 4
-    try:
-        results["equivalence"] = check_output_equivalence()
-    except Exception:
-        traceback.print_exc()
-        results["equivalence"] = False
+    # 5. Quick forward pass through refactored model
+    print("\n[5] Forward + backward (refactored model) ...")
+    from models.FusionModel import FusionAnomalyDetector
+    B, W, C, H = 2, 50, 5, 32
+    torch.manual_seed(42)
+    model = FusionAnomalyDetector(hidden_dim=H)
+    X = torch.randn(B, W, C)
+    out = model(X)
+    out["loss"].backward()
+    print(f"  [PASS] loss={out['loss'].item():.6f}, backward OK")
+
+    # 6. DataLoader round-trip with collate_windows
+    print("\n[6] DataLoader with collate_windows ...")
+    from torch.utils.data import DataLoader
+    loader = DataLoader(ds, batch_size=4, shuffle=False, collate_fn=main.collate_windows)
+    batch = next(iter(loader))
+    assert len(batch) == 3, f"Batch should be 3-tuple, got {len(batch)}"
+    bx, by, bstarts = batch
+    assert bx.shape == (4, 50, 5)
+    assert by.shape == (4, 50, 5)
+    assert bstarts.shape == (4,)
+    print(f"  [PASS] batch shapes: x={tuple(bx.shape)}, y={tuple(by.shape)}, starts={tuple(bstarts.shape)}")
 
     # Summary
-    section("Summary")
-    for name, passed in results.items():
-        status = "PASS" if passed else "FAIL"
-        print(f"  [{status}] {name}")
-
-    if all(results.values()):
-        print("\n  ALL CHECKS PASSED [OK]")
-    else:
-        print("\n  SOME CHECKS FAILED [X]")
+    print("\n" + "=" * 50)
+    if errors:
+        print(f"  FAILED ({len(errors)} error(s)):")
+        for e in errors:
+            print(f"    - {e}")
         sys.exit(1)
+    else:
+        print("  ALL CHECKS PASSED")
 
 
 if __name__ == "__main__":

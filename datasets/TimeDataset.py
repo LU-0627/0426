@@ -6,8 +6,8 @@ import torch
 from torch.utils.data import Dataset
 
 
-class SlidingWindowDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
-    """Create (x, y) window pairs from a multivariate series."""
+class SlidingWindowDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+    """Create (x, y, start_idx) window triples from a multivariate series."""
 
     def __init__(
         self,
@@ -30,9 +30,10 @@ class SlidingWindowDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
     def __len__(self) -> int:
         return len(self.starts)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         start = self.starts[idx]
         end = start + self.window_size
-        x = self.series[start:end]
-        y = x.clone()
-        return x, y
+        x = self.series[start:end]          # shape: (W, C)
+        y = x.clone()                       # shape: (W, C)
+        start_idx = torch.tensor(start, dtype=torch.long)  # shape: ()
+        return x, y, start_idx
